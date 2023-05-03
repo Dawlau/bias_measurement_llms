@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import sys
+import shutil
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
@@ -52,7 +53,7 @@ from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
-
+from transformers import TrainerCallback
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.29.0.dev0")
@@ -156,6 +157,9 @@ class DataTrainingArguments:
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
+    dataset_nickname: Optional[str] = field(
+        default=None, metadata={"help": "The nickname of the dataset to use for saving the model."}
+    )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
@@ -224,6 +228,14 @@ class DataTrainingArguments:
                 extension = self.validation_file.split(".")[-1]
                 assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
+class SaveModelOnEpochEndCallback(TrainerCallback):
+    def __init__(self, dataset_name):
+        super().__init__()
+        self.dataset_name = dataset_name
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        control.should_save = True
+
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -248,6 +260,10 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    training_args.save_strategy = "epoch"
+    training_args.logging_strategy="epoch"
+    training_args.save_total_limit = None
 
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
@@ -558,6 +574,8 @@ def main():
             preds = preds[:, :-1].reshape(-1)
             return metric.compute(predictions=preds, references=labels)
 
+    callback = SaveModelOnEpochEndCallback(data_args.dataset_nickname)
+
     # Initialize our Trainer
     trainer = Trainer(
         model=model,
@@ -572,6 +590,7 @@ def main():
         if training_args.do_eval and not is_torch_tpu_available()
         else None,
     )
+    trainer.add_callback(callback)
 
     # Training
     if training_args.do_train:
@@ -624,6 +643,14 @@ def main():
         trainer.push_to_hub(**kwargs)
     else:
         trainer.create_model_card(**kwargs)
+
+    checkpoints = [os.path.join(training_args.output_dir, fname) for fname in os.listdir(training_args.output_dir) if fname.startswith("checkpoint")]
+    checkpoints.sort()
+
+    for epoch, checkpoint in enumerate(checkpoints):
+        shutil.move(checkpoint, os.path.join("trained_models", f"gpt2_{data_args.dataset_nickname}_seed_{training_args.seed}_epoch_{epoch + 1}"))
+
+    shutil.rmtree(training_args.output_dir)
 
 
 def _mp_fn(index):
